@@ -54,9 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut output_file_path,
     );
 
-    // Run an FFmpeg command to decode video from inptu_file_path
+    // Run an FFmpeg command to decode video from input_file_path
     // Get output as grayscale (i.e., just the Y plane)
-
     let mut iter = FfmpegCommand::new() // <- Builder API like `std::process::Command`
         .input(input_file_path.to_str().unwrap())
         .format("rawvideo")
@@ -65,9 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()? // <- Ordinary `std::process::Child`
         .iter()?; // <- Blocking iterator over logs and output
 
-    // Figure out geometry of frame.
-    let mut width = 0;
-    let mut height = 0;
+    let mut width = 0u32;
+    let mut height = 0u32;
 
     let metadata = iter.collect_metadata()?;
     for i in 0..metadata.output_streams.len() {
@@ -91,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(height != 0);
 
     // Set up initial prior frame as uniform medium gray (y = 128)
-    let mut prior_frame = vec![128 as u8; (width * height) as usize];
+    let mut prior_frame = vec![128u8; (width * height) as usize];
 
     let output_file = match File::create(&output_file_path) {
         Err(_) => panic!("Error opening output file"),
@@ -99,59 +97,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Setup bit writer and arithmetic encoder.
-
     let mut buf_writer = BufWriter::new(output_file);
     let mut bw = BitWriter::new(&mut buf_writer);
-
     let mut enc = Encoder::new();
 
-    // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    // 256 adaptive contexts, one for each possible predicted value
+    let model_symbols: Vec<u8> = (0u8..=255).collect();
+    let mut contexts: Vec<VectorCountSymbolModel<u8>> = (0..256)
+        .map(|_| VectorCountSymbolModel::new(model_symbols.clone()))
+        .collect();
 
-    // Process frames
     for frame in iter.filter_frames() {
         if frame.frame_num < skip_count {
             if verbose {
                 println!("Skipping frame {}", frame.frame_num);
             }
-        } else if frame.frame_num < skip_count + count {
-            let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
-
-            let bits_written_at_start = enc.bits_written();
-
-            // Process pixels in row major order.
-            for r in 0..height {
-                for c in 0..width {
-                    let pixel_index = (r * width + c) as usize;
-
-                    // Encode difference with same pixel in prior frame.
-                    // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
-
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
-
-                    // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
-                }
-            }
-
-            prior_frame = current_frame;
-
-            let bits_written_at_end = enc.bits_written();
-
-            if verbose {
-                println!(
-                    "frame: {}, compressed size (bits): {}",
-                    frame.frame_num,
-                    bits_written_at_end - bits_written_at_start
-                );
-            }
-        } else {
+            continue;
+        }
+        if frame.frame_num >= skip_count + count {
             break;
         }
+
+        let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+        let bits_start = enc.bits_written();
+
+        // Process pixels in row major order.
+        for r in 0..height {
+            for c in 0..width {
+                let idx = (r * width + c) as usize;
+
+                // Spatio-temporal prediction: blend of prior frame (temporal) and
+                // left/top neighbors in the current frame (spatial).
+                let prediction = blend_neighbors(&prior_frame, &current_frame, width, r, c);
+
+                // Residual: how wrong was the prediction? (modular, stays in u8)
+                let residual = current_frame[idx].wrapping_sub(prediction);
+
+                // Encode residual under the context for this prediction value
+                enc.encode(&residual, &contexts[prediction as usize], &mut bw);
+                contexts[prediction as usize].incr_count(&residual);
+            }
+        }
+
+        if verbose {
+            println!(
+                "frame: {}, compressed size (bits): {}",
+                frame.frame_num,
+                enc.bits_written() - bits_start
+            );
+        }
+
+        prior_frame = current_frame;
     }
 
     // Tie off arithmetic encoder and flush to file.
@@ -161,14 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Decompress and check for correctness.
     if check_decode {
-        let output_file = match File::open(&output_file_path) {
-            Err(_) => panic!("Error opening output file"),
-            Ok(f) => f,
-        };
-        let mut buf_reader = BufReader::new(output_file);
+        let input_file = File::open(&output_file_path).expect("Error opening output file");
+        let mut buf_reader = BufReader::new(input_file);
         let mut br: BitReader<_, MSB> = BitReader::new(&mut buf_reader);
 
-        let iter = FfmpegCommand::new() // <- Builder API like `std::process::Command`
+        let dec_iter = FfmpegCommand::new() // <- Builder API like `std::process::Command`
             .input(input_file_path.to_str().unwrap())
             .format("rawvideo")
             .pix_fmt("gray8")
@@ -177,45 +170,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()?; // <- Blocking iterator over logs and output
 
         let mut dec = Decoder::new();
-
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
-
+        let mut dec_contexts: Vec<VectorCountSymbolModel<u8>> = (0..256)
+            .map(|_| VectorCountSymbolModel::new(model_symbols.clone()))
+            .collect();
         // Set up initial prior frame as uniform medium gray
-        let mut prior_frame = vec![128 as u8; (width * height) as usize];
+        let mut prior_frame = vec![128u8; (width * height) as usize];
 
-        'outer_loop: 
-        for frame in iter.filter_frames() {
-            if frame.frame_num < skip_count + count {
-                if verbose {
-                    print!("Checking frame: {} ... ", frame.frame_num);
-                }
+        'check: for frame in dec_iter.filter_frames() {
+            if frame.frame_num >= skip_count + count {
+                break;
+            }
+            if verbose {
+                print!("Checking frame {} ... ", frame.frame_num);
+            }
 
-                let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+            let original_frame: Vec<u8> = frame.data; // <- raw pixel y values
+            let mut reconstructed = vec![0u8; (width * height) as usize];
 
-                // Process pixels in row major order.
-                for r in 0..height {
-                    for c in 0..width {
-                        let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
+            // Process pixels in row major order.
+            for r in 0..height {
+                for c in 0..width {
+                    let idx = (r * width + c) as usize;
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                    // Must use the reconstructed frame for spatial neighbors (same as encoder)
+                    let prediction = blend_neighbors(&prior_frame, &reconstructed, width, r, c);
+                    let residual = dec
+                        .decode(&dec_contexts[prediction as usize], &mut br)
+                        .to_owned();
+                    dec_contexts[prediction as usize].incr_count(&residual);
 
-                        if pixel_value != current_frame[pixel_index] as i32 {
-                            println!(
-                                " error at ({}, {}), should decode {}, got {}",
-                                c, r, current_frame[pixel_index], pixel_value
-                            );
-                            println!("Abandoning check of remaining frames");
-                            break 'outer_loop;
-                        }
+                    reconstructed[idx] = prediction.wrapping_add(residual);
+
+                    if reconstructed[idx] != original_frame[idx] {
+                        println!(
+                            "error at ({}, {}): expected {}, got {}",
+                            c, r, original_frame[idx], reconstructed[idx]
+                        );
+                        println!("Abandoning check.");
+                        break 'check;
                     }
                 }
-                println!("correct.");
-                prior_frame = current_frame;
-            } else {
-                break 'outer_loop;
             }
+            if verbose {
+                println!("correct.");
+            }
+            prior_frame = reconstructed;
         }
     }
 
@@ -226,10 +225,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             count,
             enc.bits_written() / count as u64,
             (width * height * 8 * count) as f64 / enc.bits_written() as f64
-        )
+        );
     }
 
     Ok(())
+}
+
+/// Blend the temporal neighbor (same pixel in prior frame) with the spatial
+/// neighbors (left and top in the current frame) to form a prediction.
+/// Falls back gracefully at row/column boundaries.
+fn blend_neighbors(prior_frame: &[u8], current_frame: &[u8], width: u32, r: u32, c: u32) -> u8 {
+    let idx   = (r * width + c) as usize;
+    let prior = prior_frame[idx] as u32;
+    let left  = if c > 0 { current_frame[idx - 1] as u32 } else { prior };
+    let top   = if r > 0 { current_frame[((r - 1) * width + c) as usize] as u32 } else { prior };
+
+    let predicted = match (r == 0, c == 0) {
+        (true,  true)  => prior,
+        (true,  false) => (prior + left + 1) / 2,
+        (false, true)  => (prior + top  + 1) / 2,
+        (false, false) => (prior + left + top) / 3,
+    };
+
+    predicted as u8
 }
 
 fn parse_args(
@@ -240,58 +258,39 @@ fn parse_args(
     count: &mut u32,
     input_file_path: &mut PathBuf,
     output_file_path: &mut PathBuf,
-) -> () {
+) {
     let mut args = env::args().skip(1);
-
     while let Some(arg) = args.next() {
-        if arg == "-verbose" {
-            *verbose = true;
-        } else if arg == "-no_verbose" {
-            *verbose = false;
-        } else if arg == "-report" {
-            *report = true;
-        } else if arg == "-no_report" {
-            *report = false;
-        } else if arg == "-check_decode" {
-            *check_decode = true;
-        } else if arg == "-no_check_decode" {
-            *check_decode = false;
-        } else if arg == "-skip_count" {
-            match args.next() {
-                Some(skip_count_string) => {
-                    *skip_count = skip_count_string.parse::<u32>().unwrap();
-                }
-                None => {
-                    panic!("Expected count after -skip_count option");
-                }
+        match arg.as_str() {
+            "-verbose" => *verbose = true,
+            "-no_verbose" => *verbose = false,
+            "-report" => *report = true,
+            "-no_report" => *report = false,
+            "-check_decode" => *check_decode = true,
+            "-no_check_decode" => *check_decode = false,
+            "-skip_count" => {
+                *skip_count = args
+                    .next()
+                    .expect("Expected value after -skip_count")
+                    .parse()
+                    .unwrap()
             }
-        } else if arg == "-count" {
-            match args.next() {
-                Some(count_string) => {
-                    *count = count_string.parse::<u32>().unwrap();
-                }
-                None => {
-                    panic!("Expected count after -count option");
-                }
+            "-count" => {
+                *count = args
+                    .next()
+                    .expect("Expected value after -count")
+                    .parse()
+                    .unwrap()
             }
-        } else if arg == "-in" {
-            match args.next() {
-                Some(input_file_path_string) => {
-                    *input_file_path = PathBuf::from(input_file_path_string);
-                }
-                None => {
-                    panic!("Expected input file name after -in option");
-                }
+            "-in" => {
+                *input_file_path =
+                    PathBuf::from(args.next().expect("Expected path after -in"))
             }
-        } else if arg == "-out" {
-            match args.next() {
-                Some(output_file_path_string) => {
-                    *output_file_path = PathBuf::from(output_file_path_string);
-                }
-                None => {
-                    panic!("Expected output file name after -out option");
-                }
+            "-out" => {
+                *output_file_path =
+                    PathBuf::from(args.next().expect("Expected path after -out"))
             }
+            _ => {}
         }
     }
 }
